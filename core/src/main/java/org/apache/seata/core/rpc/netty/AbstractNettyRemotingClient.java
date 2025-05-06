@@ -249,12 +249,6 @@ public abstract class AbstractNettyRemotingClient extends AbstractNettyRemoting 
         if (mergeSendExecutorService != null) {
             mergeSendExecutorService.shutdown();
         }
-
-        futures.clear();
-        mergeMsgMap.clear();
-        childToParentMap.clear();
-        basketMap.clear();
-
         super.destroy();
     }
 
