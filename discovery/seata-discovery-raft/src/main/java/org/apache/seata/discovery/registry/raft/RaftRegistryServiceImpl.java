@@ -142,8 +142,15 @@ public class RaftRegistryServiceImpl implements RegistryService<ConfigChangeList
 
     private static final String PREFERRED_NETWORKS;
 
+    /**
+     * Protocol used by watch mechanism.
+     */
     private enum WatchProtocol {
+
+        /** HTTP/1.x protocol */
         HTTP1,
+
+        /** HTTP/2 protocol */
         HTTP2
     }
 
