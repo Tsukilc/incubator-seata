@@ -25,10 +25,13 @@ import okhttp3.ResponseBody;
 import org.apache.http.HttpStatus;
 import org.apache.seata.common.exception.NotSupportYetException;
 import org.apache.seata.common.exception.ParseEndpointException;
+import org.apache.seata.common.metadata.ClusterRole;
+import org.apache.seata.common.metadata.ClusterWatchEvent;
 import org.apache.seata.common.metadata.Metadata;
 import org.apache.seata.common.metadata.MetadataResponse;
 import org.apache.seata.common.metadata.Node;
 import org.apache.seata.common.util.HttpClientUtil;
+import org.apache.seata.common.util.SeataHttpWatch;
 import org.apache.seata.config.ConfigurationFactory;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -44,6 +47,7 @@ import java.lang.reflect.Method;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -1285,6 +1289,163 @@ class RaftRegistryServiceImplTest {
             System.setProperty("registry.raft.serverAddr", "127.0.0.1:8092");
             initAddresses.remove("initFlowCluster");
         }
+    }
+
+    @Test
+    public void supportsHttp2VersionThresholdTest() throws Exception {
+        Method supportsHttp2Method = RaftRegistryServiceImpl.class.getDeclaredMethod("supportsHttp2", Node.class);
+        supportsHttp2Method.setAccessible(true);
+
+        Node nullVersion = new Node();
+        nullVersion.setVersion(null);
+        assertFalse((boolean) supportsHttp2Method.invoke(null, nullVersion));
+
+        Node blankVersion = new Node();
+        blankVersion.setVersion("");
+        assertFalse((boolean) supportsHttp2Method.invoke(null, blankVersion));
+
+        Node invalidVersion = new Node();
+        invalidVersion.setVersion("invalid-version");
+        assertFalse((boolean) supportsHttp2Method.invoke(null, invalidVersion));
+
+        Node v269 = new Node();
+        v269.setVersion("2.6.9");
+        assertFalse((boolean) supportsHttp2Method.invoke(null, v269));
+
+        Node v270 = new Node();
+        v270.setVersion("2.7.0");
+        assertTrue((boolean) supportsHttp2Method.invoke(null, v270));
+
+        Node v270Snapshot = new Node();
+        v270Snapshot.setVersion("2.7.0-SNAPSHOT");
+        assertTrue((boolean) supportsHttp2Method.invoke(null, v270Snapshot));
+
+        Node v280 = new Node();
+        v280.setVersion("2.8.0");
+        assertTrue((boolean) supportsHttp2Method.invoke(null, v280));
+    }
+
+    @Test
+    public void shouldRefreshMetadataFilterInvalidEventTest() throws Exception {
+        Method shouldRefreshMetadata = RaftRegistryServiceImpl.class.getDeclaredMethod(
+                "shouldRefreshMetadata", String.class, String.class, SeataHttpWatch.Response.class);
+        shouldRefreshMetadata.setAccessible(true);
+
+        assertFalse((boolean) shouldRefreshMetadata.invoke(null, "invalidEventCluster", "default", null));
+
+        SeataHttpWatch.Response<ClusterWatchEvent> errorResponse =
+                new SeataHttpWatch.Response<>(SeataHttpWatch.Response.Type.ERROR, null);
+        assertFalse((boolean) shouldRefreshMetadata.invoke(null, "invalidEventCluster", "default", errorResponse));
+
+        SeataHttpWatch.Response<ClusterWatchEvent> nullObjectUpdate =
+                new SeataHttpWatch.Response<>(SeataHttpWatch.Response.Type.UPDATE, null);
+        assertFalse((boolean) shouldRefreshMetadata.invoke(null, "invalidEventCluster", "default", nullObjectUpdate));
+
+        ClusterWatchEvent nullMetadataEvent = new ClusterWatchEvent();
+        SeataHttpWatch.Response<ClusterWatchEvent> nullMetadataResponse =
+                new SeataHttpWatch.Response<>(SeataHttpWatch.Response.Type.UPDATE, nullMetadataEvent);
+        assertFalse(
+                (boolean) shouldRefreshMetadata.invoke(null, "invalidEventCluster", "default", nullMetadataResponse));
+
+        MetadataResponse emptyNodesMetadata = new MetadataResponse();
+        emptyNodesMetadata.setNodes(Collections.emptyList());
+        emptyNodesMetadata.setStoreMode("raft");
+        emptyNodesMetadata.setTerm(1L);
+        ClusterWatchEvent emptyNodesEvent = new ClusterWatchEvent();
+        emptyNodesEvent.setGroup("default");
+        emptyNodesEvent.setMetadata(emptyNodesMetadata);
+        SeataHttpWatch.Response<ClusterWatchEvent> emptyNodesResponse =
+                new SeataHttpWatch.Response<>(SeataHttpWatch.Response.Type.UPDATE, emptyNodesEvent);
+        assertFalse((boolean) shouldRefreshMetadata.invoke(null, "invalidEventCluster", "default", emptyNodesResponse));
+    }
+
+    @Test
+    public void shouldRefreshMetadataOnTermOrNodeChangeTest() throws Exception {
+        Field metadataField = RaftRegistryServiceImpl.class.getDeclaredField("METADATA");
+        metadataField.setAccessible(true);
+        Metadata metadata = (Metadata) metadataField.get(null);
+
+        Method shouldRefreshMetadata = RaftRegistryServiceImpl.class.getDeclaredMethod(
+                "shouldRefreshMetadata", String.class, String.class, SeataHttpWatch.Response.class);
+        shouldRefreshMetadata.setAccessible(true);
+
+        String termAdvancedCluster = "termAdvancedCluster";
+        metadata.refreshMetadata(
+                termAdvancedCluster,
+                metadataResponse(1L, createNode("127.0.0.1", 7091, 8091, "default", ClusterRole.LEADER, "2.7.0")));
+        ClusterWatchEvent termAdvancedEvent = new ClusterWatchEvent();
+        termAdvancedEvent.setGroup("default");
+        termAdvancedEvent.setMetadata(
+                metadataResponse(2L, createNode("127.0.0.1", 7091, 8091, "default", ClusterRole.LEADER, "2.7.0")));
+        SeataHttpWatch.Response<ClusterWatchEvent> termAdvancedResponse =
+                new SeataHttpWatch.Response<>(SeataHttpWatch.Response.Type.UPDATE, termAdvancedEvent);
+        assertTrue((boolean) shouldRefreshMetadata.invoke(null, termAdvancedCluster, "default", termAdvancedResponse));
+
+        String unchangedCluster = "unchangedCluster";
+        metadata.refreshMetadata(
+                unchangedCluster,
+                metadataResponse(3L, createNode("127.0.0.1", 7092, 8092, "default", ClusterRole.LEADER, "2.7.0")));
+        ClusterWatchEvent unchangedEvent = new ClusterWatchEvent();
+        unchangedEvent.setGroup("default");
+        unchangedEvent.setMetadata(
+                metadataResponse(3L, createNode("127.0.0.1", 7092, 8092, "default", ClusterRole.LEADER, "2.7.0")));
+        SeataHttpWatch.Response<ClusterWatchEvent> unchangedResponse =
+                new SeataHttpWatch.Response<>(SeataHttpWatch.Response.Type.UPDATE, unchangedEvent);
+        assertFalse((boolean) shouldRefreshMetadata.invoke(null, unchangedCluster, "default", unchangedResponse));
+
+        String nodeChangedCluster = "nodeChangedCluster";
+        metadata.refreshMetadata(
+                nodeChangedCluster,
+                metadataResponse(5L, createNode("127.0.0.1", 7093, 8093, "default", ClusterRole.LEADER, "2.7.0")));
+        ClusterWatchEvent nodeChangedEvent = new ClusterWatchEvent();
+        nodeChangedEvent.setGroup("default");
+        nodeChangedEvent.setMetadata(
+                metadataResponse(5L, createNode("127.0.0.1", 7193, 8193, "default", ClusterRole.LEADER, "2.7.0")));
+        SeataHttpWatch.Response<ClusterWatchEvent> nodeChangedResponse =
+                new SeataHttpWatch.Response<>(SeataHttpWatch.Response.Type.UPDATE, nodeChangedEvent);
+        assertTrue((boolean) shouldRefreshMetadata.invoke(null, nodeChangedCluster, "default", nodeChangedResponse));
+    }
+
+    @Test
+    public void hasMetadataChangedOrderInsensitiveTest() throws Exception {
+        Field metadataField = RaftRegistryServiceImpl.class.getDeclaredField("METADATA");
+        metadataField.setAccessible(true);
+        Metadata metadata = (Metadata) metadataField.get(null);
+
+        Method hasMetadataChanged = RaftRegistryServiceImpl.class.getDeclaredMethod(
+                "hasMetadataChanged", String.class, String.class, MetadataResponse.class);
+        hasMetadataChanged.setAccessible(true);
+
+        String clusterName = "orderInsensitiveCluster";
+        Node first = createNode("127.0.0.1", 7291, 8291, "default", ClusterRole.LEADER, "2.7.0");
+        Node second = createNode("127.0.0.1", 7292, 8292, "default", ClusterRole.FOLLOWER, "2.7.0");
+        metadata.refreshMetadata(clusterName, metadataResponse(10L, first, second));
+
+        MetadataResponse reversedOrder = metadataResponse(10L, second, first);
+        assertFalse((boolean) hasMetadataChanged.invoke(null, clusterName, "default", reversedOrder));
+
+        Node roleChanged = createNode("127.0.0.1", 7292, 8292, "default", ClusterRole.LEADER, "2.7.0");
+        MetadataResponse changedNodeSignature = metadataResponse(10L, first, roleChanged);
+        assertTrue((boolean) hasMetadataChanged.invoke(null, clusterName, "default", changedNodeSignature));
+    }
+
+    private static Node createNode(
+            String host, int controlPort, int transactionPort, String group, ClusterRole role, String version) {
+        Node node = new Node();
+        node.setControl(new Node.Endpoint(host, controlPort));
+        node.setTransaction(new Node.Endpoint(host, transactionPort));
+        node.setGroup(group);
+        node.setRole(role);
+        node.setVersion(version);
+        return node;
+    }
+
+    private static MetadataResponse metadataResponse(long term, Node... nodes) {
+        MetadataResponse metadataResponse = new MetadataResponse();
+        metadataResponse.setNodes(Arrays.asList(nodes));
+        metadataResponse.setStoreMode("raft");
+        metadataResponse.setTerm(term);
+        return metadataResponse;
     }
 
     /**
