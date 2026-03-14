@@ -70,7 +70,6 @@ import java.util.stream.Stream;
 /**
  * The type File registry service.
  */
-@SuppressWarnings("ALL")
 public class RaftRegistryServiceImpl implements RegistryService<ConfigChangeListener> {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(RaftRegistryServiceImpl.class);
@@ -351,7 +350,10 @@ public class RaftRegistryServiceImpl implements RegistryService<ConfigChangeList
             return false;
         }
 
-        String group = groupTerms.keySet().iterator().next();
+        String group = selectWatchGroup(groupTerms);
+        if (StringUtils.isBlank(group)) {
+            return false;
+        }
         String tcAddress = queryHttpAddress(clusterName, group);
         if (StringUtils.isBlank(tcAddress)) {
             return false;
@@ -371,14 +373,36 @@ public class RaftRegistryServiceImpl implements RegistryService<ConfigChangeList
         }
 
         ensureHttp2Watch(group, tcAddress, param, header);
+        SeataHttpWatch<ClusterWatchEvent> watch = HTTP2_WATCH;
+        if (watch == null) {
+            return false;
+        }
 
         try {
-            SeataHttpWatch.Response<ClusterWatchEvent> response = HTTP2_WATCH.next();
+            SeataHttpWatch.Response<ClusterWatchEvent> response = watch.next();
             return shouldRefreshMetadata(clusterName, group, response);
         } catch (RuntimeException e) {
+            if (CLOSED.get()) {
+                closeHttp2Watch();
+                return false;
+            }
             closeHttp2Watch();
             throw new RetryableException("HTTP2 watch failed", e);
         }
+    }
+
+    private static String selectWatchGroup(Map<String, Long> groupTerms) {
+        if (CollectionUtils.isEmpty(groupTerms)) {
+            return null;
+        }
+
+        if (StringUtils.isNotBlank(HTTP2_WATCH_GROUP) && groupTerms.containsKey(HTTP2_WATCH_GROUP)) {
+            return HTTP2_WATCH_GROUP;
+        }
+
+        List<String> groups = new ArrayList<>(groupTerms.keySet());
+        Collections.sort(groups);
+        return groups.get(0);
     }
 
     private static synchronized void ensureHttp2Watch(

@@ -25,6 +25,7 @@ import okhttp3.ResponseBody;
 import org.apache.http.HttpStatus;
 import org.apache.seata.common.exception.NotSupportYetException;
 import org.apache.seata.common.exception.ParseEndpointException;
+import org.apache.seata.common.exception.RetryableException;
 import org.apache.seata.common.metadata.ClusterRole;
 import org.apache.seata.common.metadata.ClusterWatchEvent;
 import org.apache.seata.common.metadata.Metadata;
@@ -67,7 +68,10 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class RaftRegistryServiceImplTest {
@@ -95,12 +99,18 @@ class RaftRegistryServiceImplTest {
     }
 
     @AfterEach
-    public void tearDown() throws NoSuchFieldException, IllegalAccessException {
+    public void tearDown() throws Exception {
         // Reset the CLOSED flag after each test
         Field closedField = RaftRegistryServiceImpl.class.getDeclaredField("CLOSED");
         closedField.setAccessible(true);
         AtomicBoolean closed = (AtomicBoolean) closedField.get(null);
         closed.set(false);
+
+        Method closeHttp2WatchMethod = RaftRegistryServiceImpl.class.getDeclaredMethod("closeHttp2Watch");
+        closeHttp2WatchMethod.setAccessible(true);
+        closeHttp2WatchMethod.invoke(null);
+
+        setStaticField("HTTP2_WATCH_GROUP", null);
     }
 
     /**
@@ -959,87 +969,22 @@ class RaftRegistryServiceImplTest {
     }
 
     /**
-     * Test watch method with null response
+     * Test watch method with null response.
+     * Note: this also covers the previous "null status line" scenario because
+     * both cases are represented as null okhttp response in current code path.
      */
     @Test
     public void watchWithNullResponseTest() throws Exception {
-        String jsonString =
-                "{\"nodes\":[{\"control\":{\"host\":\"localhost\",\"port\":7091},\"transaction\":{\"host\":\"localhost\",\"port\":8091},\"group\":\"default\",\"role\":\"LEADER\"}],\"storeMode\":\"raft\",\"term\":1}";
-
-        Field metadataField = RaftRegistryServiceImpl.class.getDeclaredField("METADATA");
-        metadataField.setAccessible(true);
-        Metadata metadata = (Metadata) metadataField.get(null);
-
-        ObjectMapper objectMapper = new ObjectMapper();
-        MetadataResponse metadataResponse = objectMapper.readValue(jsonString, MetadataResponse.class);
-        metadata.refreshMetadata("default", metadataResponse);
-
-        Field clusterNameField = RaftRegistryServiceImpl.class.getDeclaredField("CURRENT_TRANSACTION_CLUSTER_NAME");
-        clusterNameField.setAccessible(true);
-        clusterNameField.set(null, "default");
-
-        Field initAddressesField = RaftRegistryServiceImpl.class.getDeclaredField("INIT_ADDRESSES");
-        initAddressesField.setAccessible(true);
-        Map<String, List<InetSocketAddress>> initAddresses =
-                (Map<String, List<InetSocketAddress>>) initAddressesField.get(null);
-        List<InetSocketAddress> addressList = new ArrayList<>();
-        addressList.add(new InetSocketAddress("localhost", 7091));
-        initAddresses.put("default", addressList);
+        prepareWatchClusterContext(
+                "default",
+                metadataResponse(1L, createNode("localhost", 7091, 8091, "default", ClusterRole.LEADER, "2.6.9")));
 
         try (MockedStatic<HttpClientUtil> mockedStatic = Mockito.mockStatic(HttpClientUtil.class)) {
             when(HttpClientUtil.doPost(anyString(), anyMap(), anyMap(), anyInt()))
                     .thenReturn(null);
-
-            Method watchMethod = RaftRegistryServiceImpl.class.getDeclaredMethod("watch");
-            watchMethod.setAccessible(true);
-            boolean result = (boolean) watchMethod.invoke(null);
+            boolean result = invokeWatch();
 
             assertFalse(result, "Watch should return false when response is null");
-        } finally {
-            initAddresses.remove("default");
-        }
-    }
-
-    /**
-     * Test watch method with null status line
-     */
-    @Test
-    public void watchWithNullStatusLineTest() throws Exception {
-        String jsonString =
-                "{\"nodes\":[{\"control\":{\"host\":\"localhost\",\"port\":7091},\"transaction\":{\"host\":\"localhost\",\"port\":8091},\"group\":\"default\",\"role\":\"LEADER\"}],\"storeMode\":\"raft\",\"term\":1}";
-
-        Field metadataField = RaftRegistryServiceImpl.class.getDeclaredField("METADATA");
-        metadataField.setAccessible(true);
-        Metadata metadata = (Metadata) metadataField.get(null);
-
-        ObjectMapper objectMapper = new ObjectMapper();
-        MetadataResponse metadataResponse = objectMapper.readValue(jsonString, MetadataResponse.class);
-        metadata.refreshMetadata("default", metadataResponse);
-
-        Field clusterNameField = RaftRegistryServiceImpl.class.getDeclaredField("CURRENT_TRANSACTION_CLUSTER_NAME");
-        clusterNameField.setAccessible(true);
-        clusterNameField.set(null, "default");
-
-        Field initAddressesField = RaftRegistryServiceImpl.class.getDeclaredField("INIT_ADDRESSES");
-        initAddressesField.setAccessible(true);
-        Map<String, List<InetSocketAddress>> initAddresses =
-                (Map<String, List<InetSocketAddress>>) initAddressesField.get(null);
-        List<InetSocketAddress> addressList = new ArrayList<>();
-        addressList.add(new InetSocketAddress("localhost", 7091));
-        initAddresses.put("default", addressList);
-
-        try (MockedStatic<HttpClientUtil> mockedStatic = Mockito.mockStatic(HttpClientUtil.class)) {
-            // Return null to simulate null response scenario
-            when(HttpClientUtil.doPost(anyString(), anyMap(), anyMap(), anyInt()))
-                    .thenReturn(null);
-
-            Method watchMethod = RaftRegistryServiceImpl.class.getDeclaredMethod("watch");
-            watchMethod.setAccessible(true);
-            boolean result = (boolean) watchMethod.invoke(null);
-
-            assertFalse(result, "Watch should return false when response is null");
-        } finally {
-            initAddresses.remove("default");
         }
     }
 
@@ -1216,6 +1161,177 @@ class RaftRegistryServiceImplTest {
         } finally {
             initAddresses.remove("default");
         }
+    }
+
+    @Test
+    public void watchHttp2CreateAndConsumeUpdateTest() throws Exception {
+        String clusterName = "watchHttp2CreateCluster";
+        String group = "default";
+        prepareWatchClusterContext(
+                clusterName,
+                metadataResponse(1L, createNode("127.0.0.1", 7091, 8091, group, ClusterRole.LEADER, "2.7.0")));
+        setTokenNotExpired();
+
+        SeataHttpWatch<ClusterWatchEvent> watch = mockWatch();
+        when(watch.next())
+                .thenReturn(newWatchUpdateResponse(
+                        group,
+                        metadataResponse(2L, createNode("127.0.0.1", 7091, 8091, group, ClusterRole.LEADER, "2.7.0"))));
+
+        try (MockedStatic<HttpClientUtil> mockedStatic = Mockito.mockStatic(HttpClientUtil.class)) {
+            mockedStatic
+                    .when(() -> HttpClientUtil.watchPost(
+                            anyString(), anyMap(), anyMap(), eq(ClusterWatchEvent.class), anyInt()))
+                    .thenReturn(watch);
+
+            boolean result = invokeWatchHttp2(clusterName);
+            assertTrue(result, "watchHttp2 should return true when UPDATE term advances");
+
+            Metadata metadata = (Metadata) getStaticField("METADATA");
+            assertEquals(2L, metadata.getClusterTerm(clusterName).get(group).longValue());
+            mockedStatic.verify(
+                    () -> HttpClientUtil.watchPost(
+                            anyString(), anyMap(), anyMap(), eq(ClusterWatchEvent.class), anyInt()),
+                    times(1));
+        }
+    }
+
+    @Test
+    public void watchHttp2ReuseForSameGroupTest() throws Exception {
+        String clusterName = "watchHttp2ReuseCluster";
+        String group = "default";
+        prepareWatchClusterContext(
+                clusterName,
+                metadataResponse(1L, createNode("127.0.0.1", 7191, 8191, group, ClusterRole.LEADER, "2.7.0")));
+        setTokenNotExpired();
+
+        SeataHttpWatch<ClusterWatchEvent> watch = mockWatch();
+        when(watch.next())
+                .thenReturn(newWatchUpdateResponse(
+                        group,
+                        metadataResponse(2L, createNode("127.0.0.1", 7191, 8191, group, ClusterRole.LEADER, "2.7.0"))))
+                .thenReturn(newWatchUpdateResponse(
+                        group,
+                        metadataResponse(3L, createNode("127.0.0.1", 7191, 8191, group, ClusterRole.LEADER, "2.7.0"))));
+
+        try (MockedStatic<HttpClientUtil> mockedStatic = Mockito.mockStatic(HttpClientUtil.class)) {
+            mockedStatic
+                    .when(() -> HttpClientUtil.watchPost(
+                            anyString(), anyMap(), anyMap(), eq(ClusterWatchEvent.class), anyInt()))
+                    .thenReturn(watch);
+
+            assertTrue(invokeWatchHttp2(clusterName));
+            assertTrue(invokeWatchHttp2(clusterName));
+
+            mockedStatic.verify(
+                    () -> HttpClientUtil.watchPost(
+                            anyString(), anyMap(), anyMap(), eq(ClusterWatchEvent.class), anyInt()),
+                    times(1));
+        }
+    }
+
+    @Test
+    public void watchHttp2SwitchGroupStableSelectionTest() throws Exception {
+        String clusterName = "watchHttp2MultiGroupCluster";
+        Node group2Leader = createNode("127.0.0.1", 7092, 8092, "g2", ClusterRole.LEADER, "2.7.0");
+        Node group1Leader = createNode("127.0.0.1", 7091, 8091, "g1", ClusterRole.LEADER, "2.7.0");
+        prepareWatchClusterContext(clusterName, metadataResponse(1L, group2Leader), metadataResponse(1L, group1Leader));
+        setTokenNotExpired();
+        setStaticField("HTTP2_WATCH_GROUP", "missing-group");
+
+        SeataHttpWatch<ClusterWatchEvent> watch = mockWatch();
+        when(watch.next())
+                .thenReturn(newWatchUpdateResponse("g1", metadataResponse(2L, group1Leader)))
+                .thenReturn(newWatchUpdateResponse("g1", metadataResponse(3L, group1Leader)));
+
+        try (MockedStatic<HttpClientUtil> mockedStatic = Mockito.mockStatic(HttpClientUtil.class)) {
+            mockedStatic
+                    .when(() -> HttpClientUtil.watchPost(
+                            anyString(), anyMap(), anyMap(), eq(ClusterWatchEvent.class), anyInt()))
+                    .thenReturn(watch);
+
+            assertTrue(invokeWatchHttp2(clusterName));
+            assertTrue(invokeWatchHttp2(clusterName));
+
+            mockedStatic.verify(
+                    () -> HttpClientUtil.watchPost(
+                            eq("http://127.0.0.1:7091/metadata/v1/watch"),
+                            anyMap(),
+                            anyMap(),
+                            eq(ClusterWatchEvent.class),
+                            anyInt()),
+                    times(1));
+        }
+    }
+
+    @Test
+    public void watchHttp2RuntimeExceptionCloseAndRetryableTest() throws Exception {
+        String clusterName = "watchHttp2ExceptionCluster";
+        String group = "default";
+        prepareWatchClusterContext(
+                clusterName,
+                metadataResponse(1L, createNode("127.0.0.1", 7391, 8391, group, ClusterRole.LEADER, "2.7.0")));
+        setTokenNotExpired();
+
+        SeataHttpWatch<ClusterWatchEvent> watch = mockWatch();
+        when(watch.next()).thenThrow(new RuntimeException("watch stream failure"));
+
+        try (MockedStatic<HttpClientUtil> mockedStatic = Mockito.mockStatic(HttpClientUtil.class)) {
+            mockedStatic
+                    .when(() -> HttpClientUtil.watchPost(
+                            anyString(), anyMap(), anyMap(), eq(ClusterWatchEvent.class), anyInt()))
+                    .thenReturn(watch);
+
+            assertThrows(RetryableException.class, () -> invokeWatchHttp2(clusterName));
+            verify(watch, times(1)).close();
+            assertNull(getStaticField("HTTP2_WATCH"));
+            assertNull(getStaticField("HTTP2_WATCH_GROUP"));
+        }
+    }
+
+    @Test
+    public void watchHttp2ClosedStateNoRetryNoiseTest() throws Exception {
+        String clusterName = "watchHttp2ClosedCluster";
+        String group = "default";
+        prepareWatchClusterContext(
+                clusterName,
+                metadataResponse(1L, createNode("127.0.0.1", 7491, 8491, group, ClusterRole.LEADER, "2.7.0")));
+        setTokenNotExpired();
+        setClosed(true);
+
+        SeataHttpWatch<ClusterWatchEvent> watch = mockWatch();
+        when(watch.next()).thenThrow(new RuntimeException("closed during shutdown"));
+
+        try (MockedStatic<HttpClientUtil> mockedStatic = Mockito.mockStatic(HttpClientUtil.class)) {
+            mockedStatic
+                    .when(() -> HttpClientUtil.watchPost(
+                            anyString(), anyMap(), anyMap(), eq(ClusterWatchEvent.class), anyInt()))
+                    .thenReturn(watch);
+
+            boolean result = invokeWatchHttp2(clusterName);
+            assertFalse(result, "watchHttp2 should return false instead of retrying when client is closed");
+            verify(watch, times(1)).close();
+        } finally {
+            setClosed(false);
+        }
+    }
+
+    @Test
+    public void selectWatchGroupReuseAndSortedFallbackTest() throws Exception {
+        Method selectWatchGroupMethod = RaftRegistryServiceImpl.class.getDeclaredMethod("selectWatchGroup", Map.class);
+        selectWatchGroupMethod.setAccessible(true);
+
+        Map<String, Long> groupTerms = new HashMap<>();
+        groupTerms.put("g2", 1L);
+        groupTerms.put("g1", 1L);
+
+        setStaticField("HTTP2_WATCH_GROUP", "g2");
+        assertEquals("g2", selectWatchGroupMethod.invoke(null, groupTerms));
+
+        setStaticField("HTTP2_WATCH_GROUP", "unknown");
+        assertEquals("g1", selectWatchGroupMethod.invoke(null, groupTerms));
+
+        assertNull(selectWatchGroupMethod.invoke(null, Collections.emptyMap()));
     }
 
     /**
@@ -1427,6 +1543,85 @@ class RaftRegistryServiceImplTest {
         Node roleChanged = createNode("127.0.0.1", 7292, 8292, "default", ClusterRole.LEADER, "2.7.0");
         MetadataResponse changedNodeSignature = metadataResponse(10L, first, roleChanged);
         assertTrue((boolean) hasMetadataChanged.invoke(null, clusterName, "default", changedNodeSignature));
+    }
+
+    private static void prepareWatchClusterContext(String clusterName, MetadataResponse... metadataResponses)
+            throws Exception {
+        Metadata metadata = (Metadata) getStaticField("METADATA");
+        for (MetadataResponse metadataResponse : metadataResponses) {
+            metadata.refreshMetadata(clusterName, metadataResponse);
+        }
+        setStaticField("CURRENT_TRANSACTION_CLUSTER_NAME", clusterName);
+        setStaticField("CURRENT_TRANSACTION_SERVICE_GROUP", "tx");
+
+        Map<String, List<InetSocketAddress>> aliveNodes =
+                (Map<String, List<InetSocketAddress>>) getStaticField("ALIVE_NODES");
+        aliveNodes.remove("tx");
+    }
+
+    private static boolean invokeWatch() throws Exception {
+        Method watchMethod = RaftRegistryServiceImpl.class.getDeclaredMethod("watch");
+        watchMethod.setAccessible(true);
+        try {
+            return (boolean) watchMethod.invoke(null);
+        } catch (InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception) {
+                throw (Exception) cause;
+            }
+            throw new RuntimeException(cause);
+        }
+    }
+
+    private static boolean invokeWatchHttp2(String clusterName) throws Exception {
+        Method watchHttp2Method = RaftRegistryServiceImpl.class.getDeclaredMethod("watchHttp2", String.class);
+        watchHttp2Method.setAccessible(true);
+        try {
+            return (boolean) watchHttp2Method.invoke(null, clusterName);
+        } catch (InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception) {
+                throw (Exception) cause;
+            }
+            throw new RuntimeException(cause);
+        }
+    }
+
+    private static SeataHttpWatch.Response<ClusterWatchEvent> newWatchUpdateResponse(
+            String group, MetadataResponse metadataResponse) {
+        ClusterWatchEvent event = new ClusterWatchEvent();
+        event.setGroup(group);
+        event.setMetadata(metadataResponse);
+        return new SeataHttpWatch.Response<>(SeataHttpWatch.Response.Type.UPDATE, event);
+    }
+
+    private static SeataHttpWatch<ClusterWatchEvent> mockWatch() {
+        return mock(SeataHttpWatch.class);
+    }
+
+    private static void setTokenNotExpired() throws Exception {
+        Field tokenTimeStamp = RaftRegistryServiceImpl.class.getDeclaredField("tokenTimeStamp");
+        tokenTimeStamp.setAccessible(true);
+        tokenTimeStamp.setLong(RaftRegistryServiceImpl.class, System.currentTimeMillis());
+    }
+
+    private static void setClosed(boolean value) throws Exception {
+        Field closedField = RaftRegistryServiceImpl.class.getDeclaredField("CLOSED");
+        closedField.setAccessible(true);
+        AtomicBoolean closed = (AtomicBoolean) closedField.get(null);
+        closed.set(value);
+    }
+
+    private static void setStaticField(String fieldName, Object value) throws Exception {
+        Field field = RaftRegistryServiceImpl.class.getDeclaredField(fieldName);
+        field.setAccessible(true);
+        field.set(null, value);
+    }
+
+    private static Object getStaticField(String fieldName) throws Exception {
+        Field field = RaftRegistryServiceImpl.class.getDeclaredField(fieldName);
+        field.setAccessible(true);
+        return field.get(null);
     }
 
     private static Node createNode(
