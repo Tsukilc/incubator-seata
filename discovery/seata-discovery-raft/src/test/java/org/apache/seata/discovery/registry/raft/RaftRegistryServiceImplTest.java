@@ -1520,6 +1520,25 @@ class RaftRegistryServiceImplTest {
         SeataHttpWatch.Response<ClusterWatchEvent> nodeChangedResponse =
                 new SeataHttpWatch.Response<>(SeataHttpWatch.Response.Type.UPDATE, nodeChangedEvent);
         assertTrue((boolean) shouldRefreshMetadata.invoke(null, nodeChangedCluster, "default", nodeChangedResponse));
+
+        String staleTermCluster = "staleTermCluster";
+        Node currentLeader =
+                createNode("127.0.0.1", 7094, 8094, "default", ClusterRole.LEADER, "2.7.0");
+        metadata.refreshMetadata(staleTermCluster, metadataResponse(10L, currentLeader));
+        ClusterWatchEvent staleTermEvent = new ClusterWatchEvent();
+        staleTermEvent.setGroup("default");
+        staleTermEvent.setMetadata(
+                metadataResponse(
+                        9L,
+                        createNode("127.0.0.1", 7194, 8194, "default", ClusterRole.FOLLOWER, "2.7.0")));
+        SeataHttpWatch.Response<ClusterWatchEvent> staleTermResponse =
+                new SeataHttpWatch.Response<>(SeataHttpWatch.Response.Type.UPDATE, staleTermEvent);
+
+        assertFalse((boolean) shouldRefreshMetadata.invoke(null, staleTermCluster, "default", staleTermResponse));
+        assertEquals(10L, metadata.getClusterTerm(staleTermCluster).get("default").longValue());
+        assertEquals(
+                currentLeader.getTransaction().getPort(),
+                metadata.getNodes(staleTermCluster, "default").get(0).getTransaction().getPort());
     }
 
     @Test
