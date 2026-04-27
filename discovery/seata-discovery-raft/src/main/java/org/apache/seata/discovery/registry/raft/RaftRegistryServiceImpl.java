@@ -124,7 +124,7 @@ public class RaftRegistryServiceImpl implements RegistryService<ConfigChangeList
 
     private static final long RETRY_DELAY_MS = 1000L;
 
-    private static final int HTTP2_WATCH_READ_TIMEOUT_SECONDS = 300;
+    private static final int HTTP2_WATCH_READ_TIMEOUT_SECONDS = 30;
 
     private static final String MIN_HTTP2_VERSION = "2.7.0";
 
@@ -450,7 +450,10 @@ public class RaftRegistryServiceImpl implements RegistryService<ConfigChangeList
         MetadataResponse incomingMetadata = event.getMetadata();
 
         String eventGroup = StringUtils.isNotBlank(event.getGroup()) ? event.getGroup() : defaultGroup;
-        long localTerm = METADATA.getClusterTerm(clusterName).getOrDefault(eventGroup, 0L);
+        long localTerm = METADATA.getClusterTerm(clusterName).getOrDefault(eventGroup, -1L);
+        if (incomingMetadata.getTerm() < localTerm) {
+            return false;
+        }
         boolean termAdvanced = incomingMetadata.getTerm() > localTerm;
 
         boolean changed = termAdvanced || hasMetadataChanged(clusterName, eventGroup, incomingMetadata);
@@ -478,7 +481,7 @@ public class RaftRegistryServiceImpl implements RegistryService<ConfigChangeList
             return false;
         }
 
-        if (incomingMetadata.getTerm() != METADATA.getClusterTerm(clusterName).getOrDefault(group, 0L)) {
+        if (incomingMetadata.getTerm() > METADATA.getClusterTerm(clusterName).getOrDefault(group, -1L)) {
             return true;
         }
 
