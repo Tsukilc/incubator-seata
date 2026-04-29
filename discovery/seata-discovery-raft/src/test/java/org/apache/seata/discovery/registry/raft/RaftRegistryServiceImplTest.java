@@ -1522,23 +1522,24 @@ class RaftRegistryServiceImplTest {
         assertTrue((boolean) shouldRefreshMetadata.invoke(null, nodeChangedCluster, "default", nodeChangedResponse));
 
         String staleTermCluster = "staleTermCluster";
-        Node currentLeader =
-                createNode("127.0.0.1", 7094, 8094, "default", ClusterRole.LEADER, "2.7.0");
+        Node currentLeader = createNode("127.0.0.1", 7094, 8094, "default", ClusterRole.LEADER, "2.7.0");
         metadata.refreshMetadata(staleTermCluster, metadataResponse(10L, currentLeader));
         ClusterWatchEvent staleTermEvent = new ClusterWatchEvent();
         staleTermEvent.setGroup("default");
         staleTermEvent.setMetadata(
-                metadataResponse(
-                        9L,
-                        createNode("127.0.0.1", 7194, 8194, "default", ClusterRole.FOLLOWER, "2.7.0")));
+                metadataResponse(9L, createNode("127.0.0.1", 7194, 8194, "default", ClusterRole.FOLLOWER, "2.7.0")));
         SeataHttpWatch.Response<ClusterWatchEvent> staleTermResponse =
                 new SeataHttpWatch.Response<>(SeataHttpWatch.Response.Type.UPDATE, staleTermEvent);
 
         assertFalse((boolean) shouldRefreshMetadata.invoke(null, staleTermCluster, "default", staleTermResponse));
-        assertEquals(10L, metadata.getClusterTerm(staleTermCluster).get("default").longValue());
+        assertEquals(
+                10L, metadata.getClusterTerm(staleTermCluster).get("default").longValue());
         assertEquals(
                 currentLeader.getTransaction().getPort(),
-                metadata.getNodes(staleTermCluster, "default").get(0).getTransaction().getPort());
+                metadata.getNodes(staleTermCluster, "default")
+                        .get(0)
+                        .getTransaction()
+                        .getPort());
     }
 
     @Test
@@ -1562,6 +1563,48 @@ class RaftRegistryServiceImplTest {
         Node roleChanged = createNode("127.0.0.1", 7292, 8292, "default", ClusterRole.LEADER, "2.7.0");
         MetadataResponse changedNodeSignature = metadataResponse(10L, first, roleChanged);
         assertTrue((boolean) hasMetadataChanged.invoke(null, clusterName, "default", changedNodeSignature));
+    }
+
+    @Test
+    public void hasMetadataChangedEdgeCasesTest() throws Exception {
+        Metadata metadata = (Metadata) getStaticField("METADATA");
+
+        Method hasMetadataChanged = RaftRegistryServiceImpl.class.getDeclaredMethod(
+                "hasMetadataChanged", String.class, String.class, MetadataResponse.class);
+        hasMetadataChanged.setAccessible(true);
+
+        assertFalse((boolean) hasMetadataChanged.invoke(null, "nullIncomingCluster", "default", null));
+
+        Node first = createNode("127.0.0.1", 7391, 8391, "default", ClusterRole.LEADER, "2.7.0");
+        assertTrue(
+                (boolean) hasMetadataChanged.invoke(null, "emptyLocalCluster", "default", metadataResponse(1L, first)));
+
+        assertFalse((boolean) hasMetadataChanged.invoke(null, "emptyBothCluster", "default", metadataResponse(1L)));
+
+        String termChangedCluster = "termChangedCluster";
+        metadata.refreshMetadata(termChangedCluster, metadataResponse(1L, first));
+        assertTrue(
+                (boolean) hasMetadataChanged.invoke(null, termChangedCluster, "default", metadataResponse(2L, first)));
+
+        String nodeSizeChangedCluster = "nodeSizeChangedCluster";
+        metadata.refreshMetadata(nodeSizeChangedCluster, metadataResponse(3L, first));
+        Node second = createNode("127.0.0.1", 7392, 8392, "default", ClusterRole.FOLLOWER, "2.7.0");
+        assertTrue((boolean) hasMetadataChanged.invoke(
+                null, nodeSizeChangedCluster, "default", metadataResponse(3L, first, second)));
+    }
+
+    @Test
+    public void buildNodeSignatureEdgeCasesTest() throws Exception {
+        Method buildNodeSignature = RaftRegistryServiceImpl.class.getDeclaredMethod("buildNodeSignature", Node.class);
+        buildNodeSignature.setAccessible(true);
+
+        assertEquals("", buildNodeSignature.invoke(null, new Object[] {null}));
+
+        Node node = new Node();
+        node.setGroup("default");
+        node.setRole(ClusterRole.LEADER);
+        node.setVersion("2.7.0");
+        assertEquals("||LEADER|2.7.0|default", buildNodeSignature.invoke(null, node));
     }
 
     private static void prepareWatchClusterContext(String clusterName, MetadataResponse... metadataResponses)
